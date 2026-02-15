@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import AVFoundation
 import QuickLook
 import Combine
+import Charts
 
 private enum UIFormatters {
     static let weekRange: DateFormatter = {
@@ -59,6 +60,36 @@ enum TaskKind: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum TaskRecurrence: String, Codable, CaseIterable, Identifiable {
+    case none
+    case daily
+    case weekly
+    case monthly
+    case yearly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .none: return "Не повторять"
+        case .daily: return "Каждый день"
+        case .weekly: return "Каждую неделю"
+        case .monthly: return "Каждый месяц"
+        case .yearly: return "Каждый год"
+        }
+    }
+
+    var occurrenceLimit: Int {
+        switch self {
+        case .none: return 1
+        case .daily: return 120
+        case .weekly: return 104
+        case .monthly: return 36
+        case .yearly: return 8
+        }
+    }
+}
+
 struct SubjectColor: Codable, Equatable {
     var red: Double
     var green: Double
@@ -83,9 +114,13 @@ struct Task: Identifiable, Codable, Equatable {
     var title: String
     var kind: TaskKind = .homework
     var dueDate: Date
+    var createdAt: Date = Date()
     var subjectID: UUID? = nil
     var isDone: Bool = false
+    var completedAt: Date? = nil
     var isPinned: Bool = false
+    var recurrence: TaskRecurrence = .none
+    var seriesID: UUID? = nil
     var attachments: [TaskAttachment] = []
 
     enum CodingKeys: String, CodingKey {
@@ -93,9 +128,13 @@ struct Task: Identifiable, Codable, Equatable {
         case title
         case kind
         case dueDate
+        case createdAt
         case subjectID
         case isDone
+        case completedAt
         case isPinned
+        case recurrence
+        case seriesID
         case attachments
     }
 
@@ -103,17 +142,25 @@ struct Task: Identifiable, Codable, Equatable {
          title: String,
          kind: TaskKind = .homework,
          dueDate: Date,
+         createdAt: Date = Date(),
          subjectID: UUID? = nil,
          isDone: Bool = false,
+         completedAt: Date? = nil,
          isPinned: Bool = false,
+         recurrence: TaskRecurrence = .none,
+         seriesID: UUID? = nil,
          attachments: [TaskAttachment] = []) {
         self.id = id
         self.title = title
         self.kind = kind
         self.dueDate = dueDate
+        self.createdAt = createdAt
         self.subjectID = subjectID
         self.isDone = isDone
+        self.completedAt = completedAt
         self.isPinned = isPinned
+        self.recurrence = recurrence
+        self.seriesID = seriesID
         self.attachments = attachments
     }
 
@@ -123,9 +170,13 @@ struct Task: Identifiable, Codable, Equatable {
         title = try container.decode(String.self, forKey: .title)
         kind = try container.decodeIfPresent(TaskKind.self, forKey: .kind) ?? .homework
         dueDate = try container.decode(Date.self, forKey: .dueDate)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? dueDate
         subjectID = try container.decodeIfPresent(UUID.self, forKey: .subjectID)
         isDone = try container.decodeIfPresent(Bool.self, forKey: .isDone) ?? false
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        recurrence = try container.decodeIfPresent(TaskRecurrence.self, forKey: .recurrence) ?? .none
+        seriesID = try container.decodeIfPresent(UUID.self, forKey: .seriesID)
         attachments = try container.decodeIfPresent([TaskAttachment].self, forKey: .attachments) ?? []
     }
 }
@@ -287,8 +338,14 @@ struct HelloView: View {
 // MARK: - Root screen with system Tab Bar
 
 struct MainView: View {
+    private struct CreateTaskSheetPayload: Identifiable {
+        let id = UUID()
+        let initialDate: Date
+    }
+
     enum Section: String, CaseIterable, Identifiable {
         case planner
+        case stats
         case settings
 
         var id: String { rawValue }
@@ -296,6 +353,7 @@ struct MainView: View {
         var title: String {
             switch self {
             case .planner: return "Планер"
+            case .stats: return "Статистика"
             case .settings: return "Настройки"
             }
         }
@@ -303,6 +361,7 @@ struct MainView: View {
         var icon: String {
             switch self {
             case .planner: return "calendar"
+            case .stats: return "chart.xyaxis.line"
             case .settings: return "gearshape"
             }
         }
@@ -312,9 +371,9 @@ struct MainView: View {
     @State private var subjects: [Subject] = []
     @State private var selectedSection: Section = .planner
 
-    @State private var showCreateTaskSheet = false
+    @State private var createTaskSheetPayload: CreateTaskSheetPayload?
     @State private var showSubjectSetup = false
-    @State private var createTaskInitialDate = Date()
+    @AppStorage("statsResetAt") private var statsResetAt: Double = 0
 
     var body: some View {
         TabView(selection: $selectedSection) {
@@ -322,8 +381,9 @@ struct MainView: View {
                 tasks: $tasks,
                 subjects: subjects,
                 onCreateTask: { selectedDate in
-                    createTaskInitialDate = dateWithCurrentTime(for: selectedDate)
-                    showCreateTaskSheet = true
+                    createTaskSheetPayload = CreateTaskSheetPayload(
+                        initialDate: dateWithCurrentTime(for: selectedDate)
+                    )
                 }
             )
             .tabItem {
@@ -331,7 +391,37 @@ struct MainView: View {
             }
             .tag(Section.planner)
 
-            SettingsView(subjects: $subjects)
+            StatisticsView(
+                tasks: tasks,
+                subjects: subjects,
+                statsResetAt: statsResetAt,
+                onRebuildStatistics: {
+                    statsResetAt = 0
+                },
+                onResetStatistics: {
+                    statsResetAt = Date().timeIntervalSince1970
+                }
+            )
+                .tabItem {
+                    Label("Статистика", systemImage: "chart.xyaxis.line")
+                }
+                .tag(Section.stats)
+
+            SettingsView(
+                subjects: $subjects,
+                onDeleteAllTasks: {
+                    let allAttachments = Set(tasks.flatMap { $0.attachments.map(\.storedFileName) })
+                    for fileName in allAttachments {
+                        AttachmentStorage.delete(
+                            TaskAttachment(originalName: fileName, storedFileName: fileName, kind: .file)
+                        )
+                    }
+                    for task in tasks {
+                        NotificationManager.shared.removeNotification(for: task.id)
+                    }
+                    tasks.removeAll()
+                }
+            )
                 .tabItem {
                     Label("Настройки", systemImage: "gearshape")
                 }
@@ -355,8 +445,8 @@ struct MainView: View {
                 showSubjectSetup = false
             }
         }
-        .sheet(isPresented: $showCreateTaskSheet) {
-            CreateTaskView(tasks: $tasks, subjects: subjects, initialDate: createTaskInitialDate)
+        .sheet(item: $createTaskSheetPayload) { payload in
+            CreateTaskView(tasks: $tasks, subjects: subjects, initialDate: payload.initialDate)
         }
         .sheet(isPresented: $showSubjectSetup) {
             SubjectSetupView(subjects: $subjects)
@@ -375,50 +465,31 @@ struct MainView: View {
     }
 }
 
-// MARK: - Planner
+// MARK: - Monthly planner
 
-struct PlannerView: View {
+struct MonthlyPlannerView: View {
     @Binding var tasks: [Task]
     let subjects: [Subject]
     let onCreateTask: (Date) -> Void
 
-    @State private var weekStartDate: Date = Calendar.current.startOfDay(for: Date())
-    @State private var selectedDayIndex: Int = 0
-    @State private var showDateJumpSheet = false
-    @State private var jumpDate = Date()
+    @State private var displayedMonth: Date = Date()
+    @State private var selectedDate: Date = Date()
     @State private var editingTask: Task?
     @State private var selectedTaskForDetails: Task?
-    @State private var searchText = ""
+    @State private var pendingDeleteTask: Task?
+    @State private var pendingDeleteDate: Date?
 
-    private static let appCalendar: Calendar = {
+    private let calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
         cal.firstWeekday = 2
         return cal
     }()
 
-    private let calendar = PlannerView.appCalendar
-
-    private var weekDates: [Date] {
-        (0..<7).compactMap { offset in
-            calendar.date(byAdding: .day, value: offset, to: weekStartDate)
-        }
-    }
-
-    private var weekTitle: String {
-        guard let first = weekDates.first, let last = weekDates.last else { return "" }
-        return "\(UIFormatters.weekRange.string(from: first)) - \(UIFormatters.weekRange.string(from: last))"
-    }
-
-    private var selectedDate: Date {
-        guard weekDates.indices.contains(selectedDayIndex) else { return weekStartDate }
-        return weekDates[selectedDayIndex]
-    }
-
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
                 HStack {
-                    Text("Учебный планер")
+                    Text("На месяц")
                         .font(.title2.bold())
                         .foregroundColor(.white)
 
@@ -438,100 +509,460 @@ struct PlannerView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 6)
 
-                searchBar
+                HStack(spacing: 10) {
+                    Button {
+                        shiftMonth(by: -1)
+                    } label: {
+                        Image(systemName: "chevron.up")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(width: 34, height: 34)
+                            .glassEffect()
+                    }
+                    .buttonStyle(.plain)
 
-                if normalizedSearchText.isEmpty {
+                    Text(monthTitle(displayedMonth))
+                        .font(.headline.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .glassEffect()
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    Button {
+                        shiftMonth(by: 1)
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(width: 34, height: 34)
+                            .glassEffect()
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Button {
+                        goToToday()
+                    } label: {
+                        Image(systemName: "1.calendar")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 34, height: 34)
+                            .glassEffect()
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+
+                monthGrid
+
+                DayTasksList(
+                    date: selectedDate,
+                    tasks: tasksFor(selectedDate),
+                    subjects: subjects,
+                    onToggleDone: { task in toggleTask(task) },
+                    onDelete: { task in requestDelete(task, occurrenceDate: selectedDate) },
+                    onToggleImportant: { task in toggleImportant(task) },
+                    onEdit: { task in editingTask = task },
+                    onOpen: { task in selectedTaskForDetails = task }
+                )
+            }
+            .background(Color(red: 10 / 255, green: 10 / 255, blue: 12 / 255))
+        }
+        .onAppear {
+            displayedMonth = startOfMonth(for: selectedDate)
+        }
+        .sheet(item: $editingTask) { task in
+            EditTaskView(tasks: $tasks, subjects: subjects, task: task)
+        }
+        .sheet(item: $selectedTaskForDetails) { task in
+            TaskDetailsView(task: task, subjects: subjects)
+        }
+        .confirmationDialog(
+            "Удаление повторяющейся задачи",
+            isPresented: Binding(
+                get: { pendingDeleteTask != nil },
+                set: { shown in
+                    if !shown {
+                        pendingDeleteTask = nil
+                        pendingDeleteDate = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let task = pendingDeleteTask, task.recurrence != .none {
+                Button("Удалить только это событие", role: .destructive) {
+                    deleteSingleOccurrence(task: task, on: pendingDeleteDate)
+                }
+                Button("Удалить всю серию", role: .destructive) {
+                    deleteEntireSeries(task: task)
+                }
+            }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Выберите, что удалить")
+        }
+    }
+
+    private var monthGrid: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbolsMondayFirst(), id: \.self) { symbol in
+                    Text(symbol)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.white.opacity(0.8))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.horizontal, 8)
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 7), spacing: 8) {
+                ForEach(monthCells(), id: \.self) { day in
+                    let isCurrentMonthDay = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
+                    let isSelected = calendar.isDate(day, inSameDayAs: selectedDate)
+                    let indicators = indicatorsForDay(day)
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectedDate = day
+                            if !isCurrentMonthDay {
+                                displayedMonth = startOfMonth(for: day)
+                            }
+                        }
+                    } label: {
+                        VStack(spacing: 4) {
+                            Text(UIFormatters.dayNumber.string(from: day))
+                                .font(.subheadline.weight(isSelected ? .bold : .semibold))
+                                .foregroundColor(textColor(isSelected: isSelected, isCurrentMonthDay: isCurrentMonthDay))
+
+                            HStack(spacing: 3) {
+                                ForEach(Array(indicators.enumerated()), id: \.offset) { _, color in
+                                    Circle()
+                                        .fill(color)
+                                        .frame(width: 5, height: 5)
+                                }
+                            }
+                            .frame(height: 6)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(isSelected ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 8)
+        .glassEffect()
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .padding(.horizontal, 16)
+        .gesture(monthSwipeGesture)
+    }
+
+    private var monthSwipeGesture: some Gesture {
+        DragGesture(minimumDistance: 18)
+            .onEnded { value in
+                let horizontal = value.translation.width
+                let vertical = value.translation.height
+                guard abs(horizontal) > abs(vertical), abs(horizontal) > 44 else { return }
+                if horizontal < 0 {
+                    shiftMonth(by: 1)
+                } else {
+                    shiftMonth(by: -1)
+                }
+            }
+    }
+
+    private func textColor(isSelected: Bool, isCurrentMonthDay: Bool) -> Color {
+        if isSelected { return .white }
+        return isCurrentMonthDay ? .white : .white.opacity(0.38)
+    }
+
+    private func weekdaySymbolsMondayFirst() -> [String] {
+        ["П", "В", "С", "Ч", "П", "С", "В"]
+    }
+
+    private func monthTitle(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateFormat = "LLLL yyyy"
+        return formatter.string(from: date).capitalized
+    }
+
+    private func startOfMonth(for date: Date) -> Date {
+        let components = calendar.dateComponents([.year, .month], from: date)
+        return calendar.date(from: components) ?? date
+    }
+
+    private func monthCells() -> [Date] {
+        let first = startOfMonth(for: displayedMonth)
+        let startWeekday = calendar.component(.weekday, from: first)
+        let offset = (startWeekday - calendar.firstWeekday + 7) % 7
+        guard let start = calendar.date(byAdding: .day, value: -offset, to: first) else { return [] }
+        return (0..<42).compactMap { calendar.date(byAdding: .day, value: $0, to: start) }
+    }
+
+    private func indicatorsForDay(_ day: Date) -> [Color] {
+        let dayTasks = tasksFor(day)
+        var unique: [Color] = []
+        var seenKeys = Set<String>()
+        for task in dayTasks {
+            let key: String
+            let color: Color
+            if let id = task.subjectID, let subject = subjects.first(where: { $0.id == id }) {
+                color = subject.color.swiftUIColor
+                key = id.uuidString
+            } else {
+                color = .white.opacity(0.85)
+                key = "no-subject"
+            }
+            if unique.count >= 3 { break }
+            if !seenKeys.contains(key) {
+                seenKeys.insert(key)
+                unique.append(color)
+            }
+        }
+        return unique
+    }
+
+    private func tasksFor(_ day: Date) -> [Task] {
+        tasks
+            .filter { calendar.isDate($0.dueDate, inSameDayAs: day) }
+            .sorted { $0.dueDate < $1.dueDate }
+    }
+
+    private func toggleTask(_ task: Task) {
+        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        tasks[index].isDone.toggle()
+    }
+
+    private func requestDelete(_ task: Task, occurrenceDate: Date?) {
+        guard task.recurrence != .none, task.seriesID != nil else {
+            deleteTask(task)
+            return
+        }
+
+        pendingDeleteTask = task
+        pendingDeleteDate = occurrenceDate
+    }
+
+    private func deleteTask(_ task: Task) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            deleteUnsharedAttachments(of: task)
+            tasks.removeAll { $0.id == task.id }
+            NotificationManager.shared.removeNotification(for: task.id)
+        }
+    }
+
+    private func deleteSingleOccurrence(task: Task, on _: Date?) {
+        deleteTask(task)
+        pendingDeleteTask = nil
+        pendingDeleteDate = nil
+    }
+
+    private func deleteEntireSeries(task: Task) {
+        guard let seriesID = task.seriesID else {
+            deleteTask(task)
+            pendingDeleteTask = nil
+            pendingDeleteDate = nil
+            return
+        }
+
+        let seriesTasks = tasks.filter { $0.seriesID == seriesID }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            for item in seriesTasks {
+                deleteUnsharedAttachments(of: item, excludingSeriesID: seriesID)
+                NotificationManager.shared.removeNotification(for: item.id)
+            }
+            tasks.removeAll { $0.seriesID == seriesID }
+        }
+
+        pendingDeleteTask = nil
+        pendingDeleteDate = nil
+    }
+
+    private func deleteUnsharedAttachments(of task: Task, excludingSeriesID: UUID? = nil) {
+        for attachment in task.attachments {
+            let usedElsewhere = tasks.contains { candidate in
+                guard candidate.id != task.id else { return false }
+                if let seriesID = excludingSeriesID, candidate.seriesID == seriesID { return false }
+                return candidate.attachments.contains(where: { $0.storedFileName == attachment.storedFileName })
+            }
+            if !usedElsewhere {
+                AttachmentStorage.delete(attachment)
+            }
+        }
+    }
+
+    private func toggleImportant(_ task: Task) {
+        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            tasks[index].isPinned.toggle()
+        }
+        NotificationManager.shared.removeNotification(for: tasks[index].id)
+        NotificationManager.shared.scheduleNotification(for: tasks[index])
+    }
+
+    private func shiftMonth(by value: Int) {
+        guard let next = calendar.date(byAdding: .month, value: value, to: displayedMonth) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            displayedMonth = startOfMonth(for: next)
+            if !calendar.isDate(selectedDate, equalTo: displayedMonth, toGranularity: .month) {
+                selectedDate = displayedMonth
+            }
+        }
+    }
+
+    private func goToToday() {
+        let today = Date()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selectedDate = today
+            displayedMonth = startOfMonth(for: today)
+        }
+    }
+}
+
+// MARK: - Planner
+
+struct PlannerView: View {
+    @Binding var tasks: [Task]
+    let subjects: [Subject]
+    let onCreateTask: (Date) -> Void
+
+    enum DisplayMode: String, CaseIterable, Identifiable {
+        case week
+        case month
+        case year
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .week: return "Неделя"
+            case .month: return "Месяц"
+            case .year: return "Год"
+            }
+        }
+    }
+
+    @State private var displayMode: DisplayMode = .week
+    @State private var weekStartDate: Date = Calendar.current.startOfDay(for: Date())
+    @State private var selectedDayIndex: Int = 0
+    @State private var selectedCalendarDate: Date = Date()
+    @State private var displayedMonth: Date = Date()
+    @State private var displayedYear: Int = Calendar.current.component(.year, from: Date())
+    @State private var showDateJumpSheet = false
+    @State private var jumpDate = Date()
+    @State private var editingTask: Task?
+    @State private var selectedTaskForDetails: Task?
+    @State private var showSearchSheet = false
+    @State private var pendingDeleteTask: Task?
+    @State private var pendingDeleteDate: Date?
+    @State private var yearCalendarRefreshID = UUID()
+
+    private static let appCalendar: Calendar = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.firstWeekday = 2
+        return cal
+    }()
+
+    private let calendar = PlannerView.appCalendar
+    private let controlButtonSize: CGFloat = 42
+
+    private var weekDates: [Date] {
+        (0..<7).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset, to: weekStartDate)
+        }
+    }
+
+    private var weekTitle: String {
+        guard let first = weekDates.first, let last = weekDates.last else { return "" }
+        return "\(UIFormatters.weekRange.string(from: first)) - \(UIFormatters.weekRange.string(from: last))"
+    }
+
+    private var selectedDate: Date {
+        guard weekDates.indices.contains(selectedDayIndex) else { return weekStartDate }
+        return weekDates[selectedDayIndex]
+    }
+
+    private var activeDate: Date {
+        switch displayMode {
+        case .week: return selectedDate
+        case .month, .year: return selectedCalendarDate
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                HStack {
+                    Text("Учебный планер")
+                        .font(.title2.bold())
+                        .foregroundColor(.white)
+
+                    Spacer()
+
+                    modeMenuButton
+                    quickActionsCluster
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+
+                switch displayMode {
+                case .week:
                     DayTasksList(
                         date: selectedDate,
                         tasks: tasksFor(selectedDate),
                         subjects: subjects,
                         onToggleDone: { task in toggleTask(task) },
-                        onDelete: { task in deleteTask(task) },
+                        onDelete: { task in requestDelete(task, occurrenceDate: selectedDate) },
                         onToggleImportant: { task in toggleImportant(task) },
                         onEdit: { task in editingTask = task },
                         onOpen: { task in selectedTaskForDetails = task }
                     )
-                } else {
-                    SearchResultsList(
-                        query: normalizedSearchText,
-                        tasks: searchResults,
+
+                    weekControls
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
+                case .month:
+                    monthControls
+                    monthGrid
+                    DayTasksList(
+                        date: selectedCalendarDate,
+                        tasks: tasksFor(selectedCalendarDate),
                         subjects: subjects,
                         onToggleDone: { task in toggleTask(task) },
-                        onDelete: { task in deleteTask(task) },
+                        onDelete: { task in requestDelete(task, occurrenceDate: selectedCalendarDate) },
                         onToggleImportant: { task in toggleImportant(task) },
                         onEdit: { task in editingTask = task },
                         onOpen: { task in selectedTaskForDetails = task }
                     )
+                case .year:
+                    yearControls
+                    yearCalendar
                 }
-
-                VStack(spacing: 10) {
-                    HStack {
-                        Button {
-                            shiftWeek(by: -7)
-                        } label: {
-                            Image(systemName: "chevron.left")
-                                .font(.headline)
-                                .foregroundColor(.white)
-                                .frame(width: 34, height: 34)
-                                .glassEffect()
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer()
-
-                        Button {
-                            jumpDate = selectedDate
-                            showDateJumpSheet = true
-                        } label: {
-                            HStack(spacing: 6) {
-                                Text(weekTitle)
-                                Image(systemName: "calendar")
-                            }
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .glassEffect()
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer(minLength: 8)
-
-                        Button {
-                            goToToday()
-                        } label: {
-                            Image(systemName: "1.calendar")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundColor(.white)
-                                .frame(width: 34, height: 34)
-                                .glassEffect()
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer(minLength: 8)
-
-                        Button {
-                            shiftWeek(by: 7)
-                        } label: {
-                            Image(systemName: "chevron.right")
-                                .font(.headline)
-                                .foregroundColor(.white)
-                                .frame(width: 34, height: 34)
-                                .glassEffect()
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    dayPicker
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 6)
             }
             .background(Color(red: 10 / 255, green: 10 / 255, blue: 12 / 255))
         }
         .onAppear {
             weekStartDate = startOfWeek(for: Date())
             selectedDayIndex = max(0, min(6, dayIndex(for: Date())))
+            selectedCalendarDate = Date()
+            displayedMonth = startOfMonth(for: Date())
+            displayedYear = calendar.component(.year, from: Date())
         }
         .sheet(isPresented: $showDateJumpSheet) {
             DateJumpSheet(date: $jumpDate) {
@@ -545,6 +976,352 @@ struct PlannerView: View {
         .sheet(item: $selectedTaskForDetails) { task in
             TaskDetailsView(task: task, subjects: subjects)
         }
+        .sheet(isPresented: $showSearchSheet) {
+            PlannerSearchSheet(
+                tasks: $tasks,
+                subjects: subjects,
+                onDelete: { task in requestDelete(task, occurrenceDate: nil) }
+            )
+        }
+        .confirmationDialog(
+            "Удаление повторяющейся задачи",
+            isPresented: Binding(
+                get: { pendingDeleteTask != nil },
+                set: { shown in
+                    if !shown {
+                        pendingDeleteTask = nil
+                        pendingDeleteDate = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let task = pendingDeleteTask, task.recurrence != .none {
+                Button("Удалить только это событие", role: .destructive) {
+                    deleteSingleOccurrence(task: task, on: pendingDeleteDate)
+                }
+                Button("Удалить всю серию", role: .destructive) {
+                    deleteEntireSeries(task: task)
+                }
+            }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Выберите, что удалить")
+        }
+    }
+
+    private var modeMenuButton: some View {
+        Menu {
+            ForEach(DisplayMode.allCases) { mode in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        displayMode = mode
+                        syncModeState(mode)
+                    }
+                } label: {
+                    Label(mode.title, systemImage: displayMode == mode ? "checkmark" : "")
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.calendar")
+                .font(.title3.weight(.semibold))
+                .foregroundColor(.white)
+                .frame(width: controlButtonSize, height: controlButtonSize)
+                .glassEffect()
+        }
+    }
+
+    private var quickActionsCluster: some View {
+        HStack(spacing: 0) {
+            Button {
+                showSearchSheet = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.title3.weight(.semibold))
+                    .foregroundColor(.white)
+                    .frame(width: controlButtonSize, height: controlButtonSize)
+            }
+            .buttonStyle(.plain)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.22))
+                .frame(width: 1, height: 22)
+
+            Button {
+                onCreateTask(activeDate)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.title3.weight(.semibold))
+                    .foregroundColor(.white)
+                    .frame(width: controlButtonSize, height: controlButtonSize)
+            }
+            .buttonStyle(.plain)
+        }
+        .glassEffect()
+        .clipShape(Capsule())
+    }
+
+    private var weekControls: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Button {
+                    shiftWeek(by: -7)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Button {
+                    jumpDate = selectedDate
+                    showDateJumpSheet = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(weekTitle)
+                        Image(systemName: "calendar")
+                    }
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .glassEffect()
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    goToToday()
+                } label: {
+                    Image(systemName: "1.calendar")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    shiftWeek(by: 7)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+            }
+
+            dayPicker
+        }
+    }
+
+    private var monthControls: some View {
+        HStack(spacing: 0) {
+            Color.clear
+                .frame(width: controlButtonSize, height: controlButtonSize)
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                Button {
+                    shiftMonth(by: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+
+                Text(monthTitle(displayedMonth))
+                    .font(.headline.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .glassEffect()
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                Button {
+                    shiftMonth(by: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer()
+
+            Button {
+                goToTodayFromYear()
+            } label: {
+                Image(systemName: "1.calendar")
+                    .font(.title3.weight(.semibold))
+                    .foregroundColor(.white)
+                    .frame(width: controlButtonSize, height: controlButtonSize)
+                    .glassEffect()
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var yearControls: some View {
+        HStack(spacing: 0) {
+            Color.clear
+                .frame(width: controlButtonSize, height: controlButtonSize)
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                Button {
+                    displayedYear -= 1
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+
+                Text("Год \(displayedYear.formatted(.number.grouping(.never)))")
+                    .font(.headline.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .glassEffect()
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                Button {
+                    displayedYear += 1
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .frame(width: controlButtonSize, height: controlButtonSize)
+                        .glassEffect()
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer()
+
+            Button {
+                goToTodayFromYear()
+            } label: {
+                Image(systemName: "1.calendar")
+                    .font(.title3.weight(.semibold))
+                    .foregroundColor(.white)
+                    .frame(width: controlButtonSize, height: controlButtonSize)
+                    .glassEffect()
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var monthGrid: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbolsMondayFirst(), id: \.self) { symbol in
+                    Text(symbol)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.white.opacity(0.8))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+
+            let rows = monthRows(for: displayedMonth)
+            ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                HStack(spacing: 0) {
+                    ForEach(Array(row.enumerated()), id: \.offset) { _, day in
+                        if let day {
+                            monthDayButton(for: day, monthAnchor: displayedMonth)
+                        } else {
+                            Color.clear
+                                .frame(maxWidth: .infinity, minHeight: 42)
+                                .padding(.vertical, 6)
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+
+                if rowIndex < rows.count - 1 {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.22))
+                        .frame(height: 1)
+                        .padding(.horizontal, 10)
+                }
+            }
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 8)
+        .background(Color.clear)
+        .padding(.horizontal, 16)
+        .gesture(monthSwipeGesture)
+    }
+
+    private var yearCalendar: some View {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                ForEach(monthsInDisplayedYear(), id: \.self) { monthDate in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(monthTitle(monthDate))
+                            .font(.title2.bold())
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+
+                        HStack(spacing: 0) {
+                            ForEach(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"], id: \.self) { symbol in
+                                Text(symbol)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(.white.opacity(0.75))
+                                    .frame(maxWidth: .infinity)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 7), spacing: 4) {
+                            ForEach(Array(monthCells(for: monthDate).enumerated()), id: \.offset) { _, day in
+                                if let day {
+                                    yearDayButton(for: day, monthAnchor: monthDate)
+                                } else {
+                                    Color.clear
+                                        .frame(maxWidth: .infinity, minHeight: 24)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 12)
+
+                        Rectangle()
+                            .fill(Color.white.opacity(0.22))
+                            .frame(height: 1)
+                            .padding(.horizontal, 12)
+                    }
+                    .padding(.top, 4)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 4)
+        }
+        .frame(maxHeight: 530)
+        .id(yearCalendarRefreshID)
     }
 
     private var dayPicker: some View {
@@ -575,67 +1352,6 @@ struct PlannerView: View {
         .padding(.horizontal, 16)
     }
 
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(.white.opacity(0.75))
-            TextField("Поиск: название, дата, предмет", text: $searchText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .foregroundColor(.white)
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.white.opacity(0.7))
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .glassEffect()
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .padding(.horizontal, 16)
-    }
-
-    private var normalizedSearchText: String {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private var subjectNameByID: [UUID: String] {
-        Dictionary(uniqueKeysWithValues: subjects.map { ($0.id, $0.name.lowercased()) })
-    }
-
-    private var searchResults: [Task] {
-        tasks
-            .filter { matchesSearch($0, query: normalizedSearchText) }
-            .sorted { $0.dueDate < $1.dueDate }
-    }
-
-    private func matchesSearch(_ task: Task, query: String) -> Bool {
-        guard !query.isEmpty else { return true }
-
-        let title = task.title.lowercased()
-        if title.contains(query) { return true }
-
-        let dateString = TaskDetailsView.dateTimeFormatter.string(from: task.dueDate).lowercased()
-        if dateString.contains(query) { return true }
-
-        let dayString = UIFormatters.fullDayHeader.string(from: task.dueDate).lowercased()
-        if dayString.contains(query) { return true }
-
-        let timeString = UIFormatters.time.string(from: task.dueDate).lowercased()
-        if timeString.contains(query) { return true }
-
-        if let id = task.subjectID, let subjectName = subjectNameByID[id], subjectName.contains(query) {
-            return true
-        }
-
-        return false
-    }
-
     private func tasksFor(_ day: Date) -> [Task] {
         tasks
             .filter { calendar.isDate($0.dueDate, inSameDayAs: day) }
@@ -645,15 +1361,68 @@ struct PlannerView: View {
     private func toggleTask(_ task: Task) {
         guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
         tasks[index].isDone.toggle()
+        tasks[index].completedAt = tasks[index].isDone ? Date() : nil
+    }
+
+    private func requestDelete(_ task: Task, occurrenceDate: Date?) {
+        guard task.recurrence != .none, task.seriesID != nil else {
+            deleteTask(task)
+            return
+        }
+
+        pendingDeleteTask = task
+        pendingDeleteDate = occurrenceDate
     }
 
     private func deleteTask(_ task: Task) {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            task.attachments.forEach { AttachmentStorage.delete($0) }
+            deleteUnsharedAttachments(of: task)
             tasks.removeAll { $0.id == task.id }
             NotificationManager.shared.removeNotification(for: task.id)
+        }
+    }
+
+    private func deleteSingleOccurrence(task: Task, on _: Date?) {
+        deleteTask(task)
+        pendingDeleteTask = nil
+        pendingDeleteDate = nil
+    }
+
+    private func deleteEntireSeries(task: Task) {
+        guard let seriesID = task.seriesID else {
+            deleteTask(task)
+            pendingDeleteTask = nil
+            pendingDeleteDate = nil
+            return
+        }
+
+        let seriesTasks = tasks.filter { $0.seriesID == seriesID }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            for item in seriesTasks {
+                deleteUnsharedAttachments(of: item, excludingSeriesID: seriesID)
+                NotificationManager.shared.removeNotification(for: item.id)
+            }
+            tasks.removeAll { $0.seriesID == seriesID }
+        }
+
+        pendingDeleteTask = nil
+        pendingDeleteDate = nil
+    }
+
+    private func deleteUnsharedAttachments(of task: Task, excludingSeriesID: UUID? = nil) {
+        for attachment in task.attachments {
+            let usedElsewhere = tasks.contains { candidate in
+                guard candidate.id != task.id else { return false }
+                if let seriesID = excludingSeriesID, candidate.seriesID == seriesID { return false }
+                return candidate.attachments.contains(where: { $0.storedFileName == attachment.storedFileName })
+            }
+            if !usedElsewhere {
+                AttachmentStorage.delete(attachment)
+            }
         }
     }
 
@@ -664,6 +1433,8 @@ struct PlannerView: View {
         withTransaction(transaction) {
             tasks[index].isPinned.toggle()
         }
+        NotificationManager.shared.removeNotification(for: tasks[index].id)
+        NotificationManager.shared.scheduleNotification(for: tasks[index])
     }
 
     private func startOfWeek(for date: Date) -> Date {
@@ -691,6 +1462,16 @@ struct PlannerView: View {
         let today = Date()
         weekStartDate = startOfWeek(for: today)
         selectedDayIndex = max(0, min(6, dayIndex(for: today)))
+        selectedCalendarDate = today
+        displayedMonth = startOfMonth(for: today)
+        displayedYear = calendar.component(.year, from: today)
+    }
+
+    private func goToTodayFromYear() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            goToToday()
+        }
+        yearCalendarRefreshID = UUID()
     }
 
     private func shortWeekday(for date: Date) -> String {
@@ -699,6 +1480,184 @@ struct PlannerView: View {
 
     private func dayNumber(for date: Date) -> String {
         UIFormatters.dayNumber.string(from: date)
+    }
+
+    private func syncModeState(_ mode: DisplayMode) {
+        switch mode {
+        case .week:
+            weekStartDate = startOfWeek(for: selectedCalendarDate)
+            selectedDayIndex = max(0, min(6, dayIndex(for: selectedCalendarDate)))
+        case .month:
+            displayedMonth = startOfMonth(for: selectedCalendarDate)
+        case .year:
+            displayedYear = calendar.component(.year, from: selectedCalendarDate)
+        }
+    }
+
+    private var monthSwipeGesture: some Gesture {
+        DragGesture(minimumDistance: 10)
+            .onEnded { value in
+                let horizontal = value.translation.width
+                let vertical = value.translation.height
+                guard abs(horizontal) > abs(vertical), abs(horizontal) > 24 else { return }
+                if horizontal < 0 {
+                    shiftMonth(by: 1)
+                } else {
+                    shiftMonth(by: -1)
+                }
+            }
+    }
+
+    private func shiftMonth(by value: Int) {
+        guard let next = calendar.date(byAdding: .month, value: value, to: displayedMonth) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            displayedMonth = startOfMonth(for: next)
+            if !calendar.isDate(selectedCalendarDate, equalTo: displayedMonth, toGranularity: .month) {
+                selectedCalendarDate = displayedMonth
+            }
+        }
+    }
+
+    private func monthTitle(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateFormat = "LLLL yyyy"
+        return formatter.string(from: date).capitalized
+    }
+
+    private func weekdaySymbolsMondayFirst() -> [String] {
+        ["П", "В", "С", "Ч", "П", "С", "В"]
+    }
+
+    private func startOfMonth(for date: Date) -> Date {
+        let components = calendar.dateComponents([.year, .month], from: date)
+        return calendar.date(from: components) ?? date
+    }
+
+    private func monthCells(for month: Date) -> [Date?] {
+        let first = startOfMonth(for: month)
+        let startWeekday = calendar.component(.weekday, from: first)
+        let offset = (startWeekday - calendar.firstWeekday + 7) % 7
+        let range = calendar.range(of: .day, in: .month, for: first) ?? (1..<31)
+        var cells: [Date?] = Array(repeating: nil, count: offset)
+        for day in range {
+            var components = calendar.dateComponents([.year, .month], from: first)
+            components.day = day
+            cells.append(calendar.date(from: components))
+        }
+        let tail = (7 - (cells.count % 7)) % 7
+        cells.append(contentsOf: Array(repeating: nil, count: tail))
+        return cells
+    }
+
+    private func monthRows(for month: Date) -> [[Date?]] {
+        let cells = monthCells(for: month)
+        return stride(from: 0, to: cells.count, by: 7).map { start in
+            Array(cells[start ..< min(start + 7, cells.count)])
+        }
+    }
+
+    private func monthDayButton(for day: Date, monthAnchor: Date) -> some View {
+        let isCurrentMonthDay = calendar.isDate(day, equalTo: monthAnchor, toGranularity: .month)
+        let isSelected = calendar.isDate(day, inSameDayAs: selectedCalendarDate)
+        let indicators = indicatorsForDay(day)
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                selectedCalendarDate = day
+                if !isCurrentMonthDay {
+                    displayedMonth = startOfMonth(for: day)
+                }
+            }
+        } label: {
+            VStack(spacing: 4) {
+                Text(UIFormatters.dayNumber.string(from: day))
+                    .font(.subheadline.weight(isSelected ? .bold : .semibold))
+                    .foregroundColor(isSelected ? .white : (isCurrentMonthDay ? .white : .white.opacity(0.38)))
+                    .frame(width: 30, height: 30)
+                    .background(
+                        Circle()
+                            .fill(isSelected ? Color.red : Color.clear)
+                    )
+
+                HStack(spacing: 3) {
+                    ForEach(Array(indicators.enumerated()), id: \.offset) { _, color in
+                        Circle()
+                            .fill(color)
+                            .frame(width: 5, height: 5)
+                    }
+                }
+                .frame(height: 6)
+            }
+            .frame(maxWidth: .infinity, minHeight: 42)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func yearDayButton(for day: Date, monthAnchor: Date) -> some View {
+        let isCurrentMonthDay = calendar.isDate(day, equalTo: monthAnchor, toGranularity: .month)
+        let isSelected = calendar.isDate(day, inSameDayAs: selectedCalendarDate)
+        let indicators = indicatorsForDay(day)
+
+        return Button {
+            selectedCalendarDate = day
+            displayedMonth = startOfMonth(for: day)
+        } label: {
+            VStack(spacing: 2) {
+                Text(UIFormatters.dayNumber.string(from: day))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(isSelected ? .white : (isCurrentMonthDay ? .white.opacity(0.95) : .white.opacity(0.25)))
+                    .frame(width: 24, height: 24)
+                    .background(
+                        Circle()
+                            .fill(isSelected ? Color.red : Color.clear)
+                    )
+                HStack(spacing: 2) {
+                    ForEach(Array(indicators.enumerated()), id: \.offset) { _, color in
+                        Circle()
+                            .fill(color)
+                            .frame(width: 4, height: 4)
+                    }
+                }
+                .frame(height: 4)
+            }
+            .frame(maxWidth: .infinity, minHeight: 30)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func monthsInDisplayedYear() -> [Date] {
+        (1...12).compactMap { month in
+            var components = DateComponents()
+            components.year = displayedYear
+            components.month = month
+            components.day = 1
+            return calendar.date(from: components)
+        }
+    }
+
+    private func indicatorsForDay(_ day: Date) -> [Color] {
+        let dayTasks = tasksFor(day)
+        var unique: [Color] = []
+        var seenKeys = Set<String>()
+        for task in dayTasks {
+            let key: String
+            let color: Color
+            if let id = task.subjectID, let subject = subjects.first(where: { $0.id == id }) {
+                color = subject.color.swiftUIColor
+                key = id.uuidString
+            } else {
+                color = .white.opacity(0.85)
+                key = "no-subject"
+            }
+            if unique.count >= 3 { break }
+            if !seenKeys.contains(key) {
+                seenKeys.insert(key)
+                unique.append(color)
+            }
+        }
+        return unique
     }
 }
 
@@ -779,7 +1738,7 @@ struct DayTasksList: View {
                                 Label(task.isPinned ? "Убрать важное" : "Важное",
                                       systemImage: task.isPinned ? "star.slash" : "star.fill")
                             }
-                            .tint(.yellow)
+                            .tint(.orange)
 
                             Button {
                                 onEdit(task)
@@ -855,7 +1814,7 @@ struct SearchResultsList: View {
                                 Label(task.isPinned ? "Убрать важное" : "Важное",
                                       systemImage: task.isPinned ? "star.slash" : "star.fill")
                             }
-                            .tint(.yellow)
+                            .tint(.orange)
 
                             Button {
                                 onEdit(task)
@@ -878,6 +1837,112 @@ struct SearchResultsList: View {
     private func subject(for task: Task) -> Subject? {
         guard let id = task.subjectID else { return nil }
         return subjects.first(where: { $0.id == id })
+    }
+}
+
+struct PlannerSearchSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var tasks: [Task]
+    let subjects: [Subject]
+    let onDelete: (Task) -> Void
+
+    @State private var query = ""
+    @State private var editingTask: Task?
+    @State private var selectedTask: Task?
+
+    private var normalizedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var subjectNameByID: [UUID: String] {
+        Dictionary(uniqueKeysWithValues: subjects.map { ($0.id, $0.name.lowercased()) })
+    }
+
+    private var results: [Task] {
+        guard !normalizedQuery.isEmpty else { return [] }
+        return tasks
+            .filter { matchesSearch($0, query: normalizedQuery) }
+            .sorted { $0.dueDate < $1.dueDate }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.white.opacity(0.75))
+                    TextField("Поиск: название, дата, предмет", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .foregroundColor(.white)
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .glassEffect()
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .padding(.horizontal, 16)
+
+                SearchResultsList(
+                    query: normalizedQuery,
+                    tasks: results,
+                    subjects: subjects,
+                    onToggleDone: toggleTask,
+                    onDelete: onDelete,
+                    onToggleImportant: toggleImportant,
+                    onEdit: { editingTask = $0 },
+                    onOpen: { selectedTask = $0 }
+                )
+            }
+            .background(Color(red: 10 / 255, green: 10 / 255, blue: 12 / 255))
+            .navigationTitle("Поиск")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Закрыть") { dismiss() }
+                }
+            }
+        }
+        .sheet(item: $editingTask) { task in
+            EditTaskView(tasks: $tasks, subjects: subjects, task: task)
+        }
+        .sheet(item: $selectedTask) { task in
+            TaskDetailsView(task: task, subjects: subjects)
+        }
+    }
+
+    private func matchesSearch(_ task: Task, query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        if task.title.lowercased().contains(query) { return true }
+        if TaskDetailsView.dateTimeFormatter.string(from: task.dueDate).lowercased().contains(query) { return true }
+        if UIFormatters.fullDayHeader.string(from: task.dueDate).lowercased().contains(query) { return true }
+        if UIFormatters.time.string(from: task.dueDate).lowercased().contains(query) { return true }
+        if let id = task.subjectID, let subjectName = subjectNameByID[id], subjectName.contains(query) { return true }
+        return false
+    }
+
+    private func toggleTask(_ task: Task) {
+        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        tasks[index].isDone.toggle()
+        tasks[index].completedAt = tasks[index].isDone ? Date() : nil
+    }
+
+    private func toggleImportant(_ task: Task) {
+        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            tasks[index].isPinned.toggle()
+        }
+        NotificationManager.shared.removeNotification(for: tasks[index].id)
+        NotificationManager.shared.scheduleNotification(for: tasks[index])
     }
 }
 
@@ -916,10 +1981,10 @@ struct TaskCard: View {
 
                         Text("Важное")
                             .font(.caption2.weight(.semibold))
-                            .foregroundColor(.black)
+                            .foregroundColor(.white)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.yellow))
+                            .background(Capsule().fill(Color.orange))
                             .opacity(task.isPinned ? 1 : 0)
                             .accessibilityHidden(!task.isPinned)
                     }
@@ -930,6 +1995,12 @@ struct TaskCard: View {
                     Text(timeString(task.dueDate))
                         .font(.caption)
                         .foregroundColor(.white.opacity(0.8))
+
+                    if task.recurrence != .none {
+                        Image(systemName: "repeat")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.8))
+                    }
 
                     if !task.attachments.isEmpty {
                         Image(systemName: "paperclip")
@@ -961,7 +2032,7 @@ struct TaskCard: View {
                 .fill(Color.white.opacity(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 20)
-                        .stroke(task.isPinned ? Color.yellow.opacity(0.9) : Color.white.opacity(0.14),
+                        .stroke(task.isPinned ? Color.orange.opacity(0.9) : Color.white.opacity(0.14),
                                 lineWidth: task.isPinned ? 1.6 : 1)
                 )
         )
@@ -972,13 +2043,448 @@ struct TaskCard: View {
     }
 }
 
+// MARK: - Statistics
+
+struct StatisticsView: View {
+    let tasks: [Task]
+    let subjects: [Subject]
+    let statsResetAt: Double
+    let onRebuildStatistics: () -> Void
+    let onResetStatistics: () -> Void
+    @State private var mainChartMode: ChartMode = .month
+    @State private var showResetAlert = false
+    @State private var statisticsRefreshID = UUID()
+
+    private enum ChartMode: String, CaseIterable, Identifiable {
+        case month
+        case week
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .month: return "По месяцам"
+            case .week: return "По неделям"
+            }
+        }
+    }
+
+    private struct MonthStat: Identifiable {
+        let id = UUID()
+        let label: String
+        let score: Double
+    }
+
+    private struct TrendSegment: Identifiable {
+        let id = UUID()
+        let startLabel: String
+        let endLabel: String
+        let startScore: Double
+        let endScore: Double
+    }
+
+    private struct SubjectStat: Identifiable {
+        let id: UUID
+        let title: String
+        let tint: Color
+        let missed: Int
+        let completed: Int
+        let percent: Int
+        let total: Int
+        let onTime: Int
+        let monthStats: [MonthStat]
+        let rankingScore: Double
+    }
+
+    private var resetDate: Date? {
+        statsResetAt > 0 ? Date(timeIntervalSince1970: statsResetAt) : nil
+    }
+
+    private var scopedTasks: [Task] {
+        guard let resetDate else { return tasks }
+        return tasks.filter { $0.createdAt >= resetDate }
+    }
+
+    private func metricValues(for sourceTasks: [Task]) -> (missed: Int, completed: Int, onTime: Int, percent: Int) {
+        let done = sourceTasks.filter(\.isDone)
+        let onTime = done.filter { task in
+            guard let completedAt = task.completedAt else { return false }
+            return Calendar.current.isDate(completedAt, inSameDayAs: task.createdAt)
+        }.count
+        let missed = sourceTasks.filter { !$0.isDone && $0.dueDate < Date() }.count
+        let completed = done.count
+        let percent: Int
+        if sourceTasks.isEmpty {
+            percent = 0
+        } else {
+            let base = (Double(completed) / Double(sourceTasks.count)) * 100
+            let bonusShare = completed == 0 ? 0 : (Double(onTime) / Double(completed))
+            let bonus = bonusShare * 12
+            percent = Int(min(100, (base + bonus).rounded()))
+        }
+        return (missed, completed, onTime, percent)
+    }
+
+    private var overallMetrics: (missed: Int, completed: Int, onTime: Int, percent: Int) {
+        metricValues(for: scopedTasks)
+    }
+
+    private var missedCount: Int { overallMetrics.missed }
+
+    private var completedCount: Int { overallMetrics.completed }
+
+    private var boostedCompletionPercent: Int { overallMetrics.percent }
+
+    private func monthlyStats(for sourceTasks: [Task]) -> [MonthStat] {
+        let calendar = Calendar.current
+        let currentMonthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: Date())) ?? Date()
+        let filtered = sourceTasks.filter { $0.dueDate >= currentMonthStart }
+        let groupedFiltered = Dictionary(grouping: filtered) { task in
+            calendar.date(from: calendar.dateComponents([.year, .month], from: task.dueDate)) ?? task.dueDate
+        }
+        let sortedKeys = groupedFiltered.keys.sorted()
+        return sortedKeys.suffix(6).map { key in
+            let monthTasks = groupedFiltered[key] ?? []
+            let metrics = metricValues(for: monthTasks)
+            return MonthStat(label: monthFormatter.string(from: key).capitalized, score: Double(metrics.percent))
+        }
+    }
+
+    private var summaryMessage: String {
+        if scopedTasks.isEmpty { return "После сброса пока нет данных. Добавляй задачи и смотри динамику." }
+        if boostedCompletionPercent >= 85 { return "Круто, молодец. Ты держишь очень сильный темп." }
+        if boostedCompletionPercent >= 65 { return "Нормальный темп. Чуть меньше пропусков и будет отлично." }
+        return "Пока много пропусков. Сконцентрируйся на 2-3 задачах в день."
+    }
+
+    private var monthFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateFormat = "LLL"
+        return formatter
+    }
+
+    private var monthlyStats: [MonthStat] {
+        monthlyStats(for: scopedTasks)
+    }
+
+    private func weekDayStats(for sourceTasks: [Task]) -> [MonthStat] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.firstWeekday = 2
+        let weekStart = calendar.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+
+        let weekdayFormatter = DateFormatter()
+        weekdayFormatter.locale = Locale(identifier: "ru_RU")
+        weekdayFormatter.dateFormat = "EE"
+
+        return (0..<7).compactMap { offset in
+            guard let day = calendar.date(byAdding: .day, value: offset, to: weekStart) else { return nil }
+            let dayTasks = sourceTasks.filter { calendar.isDate($0.dueDate, inSameDayAs: day) }
+            let metrics = metricValues(for: dayTasks)
+            let raw = weekdayFormatter.string(from: day).replacingOccurrences(of: ".", with: "")
+            let label = raw.prefix(1).uppercased() + raw.dropFirst()
+            return MonthStat(label: label, score: Double(metrics.percent))
+        }
+    }
+
+    private var subjectStats: [SubjectStat] {
+        let grouped = Dictionary(grouping: scopedTasks) { $0.subjectID }
+        var items: [SubjectStat] = []
+
+        for subject in subjects {
+            let tasksForSubject = grouped[subject.id] ?? []
+            guard !tasksForSubject.isEmpty else { continue }
+            let metrics = metricValues(for: tasksForSubject)
+            let completionRate = Double(metrics.completed) / Double(max(tasksForSubject.count, 1))
+            let onTimeRate = Double(metrics.onTime) / Double(max(metrics.completed, 1))
+            let ranking = (completionRate * 0.72) + (onTimeRate * 0.28)
+
+            items.append(
+                SubjectStat(
+                    id: subject.id,
+                    title: subject.name,
+                    tint: subject.color.swiftUIColor,
+                    missed: metrics.missed,
+                    completed: metrics.completed,
+                    percent: metrics.percent,
+                    total: tasksForSubject.count,
+                    onTime: metrics.onTime,
+                    monthStats: monthlyStats(for: tasksForSubject),
+                    rankingScore: ranking
+                )
+            )
+        }
+
+        return items.sorted {
+            if $0.rankingScore == $1.rankingScore {
+                return $0.completed > $1.completed
+            }
+            return $0.rankingScore > $1.rankingScore
+        }
+    }
+
+    private func points(for mode: ChartMode) -> [MonthStat] {
+        switch mode {
+        case .month:
+            return monthlyStats
+        case .week:
+            return weekDayStats(for: scopedTasks)
+        }
+    }
+
+    private func trendSegments(for points: [MonthStat]) -> [TrendSegment] {
+        guard points.count > 1 else { return [] }
+        return (0..<(points.count - 1)).map { index in
+            let start = points[index]
+            let end = points[index + 1]
+            return TrendSegment(
+                startLabel: start.label,
+                endLabel: end.label,
+                startScore: start.score,
+                endScore: end.score
+            )
+        }
+    }
+
+    private func trendColor(for segment: TrendSegment) -> Color {
+        if segment.endScore > segment.startScore { return .green }
+        if segment.endScore < segment.startScore { return .red }
+        return .gray
+    }
+
+    private func trendChart(points: [MonthStat], height: CGFloat, lineWidth: CGFloat, symbolSize: CGFloat, xAxisLabel: String) -> some View {
+        let segments = trendSegments(for: points)
+        return Chart {
+            ForEach(segments) { segment in
+                LineMark(
+                    x: .value("Период", segment.startLabel),
+                    y: .value("Процент", segment.startScore),
+                    series: .value("Сегмент", segment.id.uuidString)
+                )
+                .interpolationMethod(.linear)
+                .foregroundStyle(trendColor(for: segment))
+                .lineStyle(StrokeStyle(lineWidth: lineWidth))
+
+                LineMark(
+                    x: .value("Период", segment.endLabel),
+                    y: .value("Процент", segment.endScore),
+                    series: .value("Сегмент", segment.id.uuidString)
+                )
+                .interpolationMethod(.linear)
+                .foregroundStyle(trendColor(for: segment))
+                .lineStyle(StrokeStyle(lineWidth: lineWidth))
+            }
+
+            ForEach(points) { point in
+                PointMark(
+                    x: .value("Период", point.label),
+                    y: .value("Процент", point.score)
+                )
+                .symbolSize(symbolSize)
+                .foregroundStyle(.white)
+            }
+        }
+        .frame(height: height)
+        .chartYScale(domain: 0...100)
+        .chartXAxisLabel(xAxisLabel)
+        .chartYAxisLabel("Процент, %")
+    }
+
+    private var subjectSummary: String {
+        guard let best = subjectStats.first else { return "Добавь задачи с предметами, и здесь появится аналитика по каждому предмету." }
+        guard let worst = subjectStats.last, subjectStats.count > 1 else {
+            return "Самый стабильный предмет сейчас: \(best.title). Выполнено \(best.completed) из \(best.total), в срок \(best.onTime)."
+        }
+        return "Лучший предмет: \(best.title) (\(best.percent)%). Зона роста: \(worst.title) (\(worst.percent)%)."
+    }
+
+    var body: some View {
+        let mainPoints = points(for: mainChartMode)
+
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Text("Статистика")
+                            .font(.title2.bold())
+                            .foregroundColor(.white)
+
+                        Spacer()
+
+                        HStack(spacing: 0) {
+                            Button {
+                                onRebuildStatistics()
+                                statisticsRefreshID = UUID()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 42, height: 42)
+                            }
+                            .buttonStyle(.plain)
+
+                            Rectangle()
+                                .fill(Color.white.opacity(0.22))
+                                .frame(width: 1, height: 22)
+
+                            Button {
+                                showResetAlert = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 42, height: 42)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .glassEffect()
+                        .clipShape(Capsule())
+                    }
+
+                    Text(summaryMessage)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(Color.white.opacity(0.1))
+                        )
+
+                    trendChart(
+                        points: mainPoints,
+                        height: 230,
+                        lineWidth: 2.5,
+                        symbolSize: 48,
+                        xAxisLabel: mainChartMode == .month ? "Последние месяцы" : "Текущая неделя"
+                    )
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Color.white.opacity(0.08))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                            )
+                    )
+
+                    Picker("Период основного графика", selection: $mainChartMode) {
+                        ForEach(ChartMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    HStack(spacing: 8) {
+                        StatBadge(title: "Пропущено", value: "\(missedCount)", tint: .orange)
+                        StatBadge(title: "Выполнено", value: "\(completedCount)", tint: .green)
+                        StatBadge(title: "Процент", value: "\(boostedCompletionPercent)%", tint: .blue)
+                    }
+
+                    Text(subjectSummary)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(Color.white.opacity(0.1))
+                        )
+
+                    ForEach(subjectStats) { subject in
+                        let subjectPoints = subject.monthStats
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(subject.tint)
+                                    .frame(width: 10, height: 10)
+                                Text(subject.title)
+                                    .font(.headline.weight(.semibold))
+                                    .foregroundColor(.white)
+                            }
+
+                            trendChart(
+                                points: subjectPoints,
+                                height: 150,
+                                lineWidth: 2.2,
+                                symbolSize: 36,
+                                xAxisLabel: "Месяцы"
+                            )
+
+                            HStack(spacing: 8) {
+                                StatBadge(title: "Пропущено", value: "\(subject.missed)", tint: .orange)
+                                StatBadge(title: "Выполнено", value: "\(subject.completed)", tint: .green)
+                                StatBadge(title: "Процент", value: "\(subject.percent)%", tint: .blue)
+                            }
+                        }
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(Color.white.opacity(0.06))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16)
+                                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                                )
+                        )
+                    }
+                }
+                .padding(16)
+                .id(statisticsRefreshID)
+            }
+            .background(Color(red: 10 / 255, green: 10 / 255, blue: 12 / 255))
+            .alert("Сбросить статистику?", isPresented: $showResetAlert) {
+                Button("Сбросить", role: .destructive) {
+                    onResetStatistics()
+                    statisticsRefreshID = UUID()
+                }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text("Это очистит данные статистики. Задачи останутся.")
+            }
+        }
+    }
+}
+
+struct StatBadge: View {
+    let title: String
+    let value: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.white.opacity(0.75))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .frame(maxWidth: .infinity, alignment: .center)
+            Text(value)
+                .font(.headline.bold())
+                .foregroundColor(tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 64, maxHeight: 64, alignment: .center)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.white.opacity(0.08))
+        )
+    }
+}
+
 // MARK: - Settings and subjects
 
 struct SettingsView: View {
     @Binding var subjects: [Subject]
+    let onDeleteAllTasks: () -> Void
 
     @State private var newSubjectName = ""
     @State private var selectedColor: Color = .blue
+    @State private var showDeleteAllAlert = false
 
     var body: some View {
         NavigationStack {
@@ -1009,8 +2515,22 @@ struct SettingsView: View {
                         .onDelete(perform: deleteSubject)
                     }
                 }
+
+                Section("Напоминания") {
+                    Button("Удалить все напоминания", role: .destructive) {
+                        showDeleteAllAlert = true
+                    }
+                }
             }
             .navigationTitle("Настройки")
+            .alert("Удалить все напоминания?", isPresented: $showDeleteAllAlert) {
+                Button("Удалить", role: .destructive) {
+                    onDeleteAllTasks()
+                }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text("Это действие удалит все задачи и уведомления.")
+            }
         }
     }
 
@@ -1118,7 +2638,8 @@ struct CreateTaskView: View {
     @State private var selectedKind: TaskKind = .homework
     @State private var selectedSubjectID: UUID? = nil
     @State private var dueDate: Date
-    @State private var addNotification = true
+        @State private var selectedRecurrence: TaskRecurrence = .none
+    @State private var isImportant = false
     @State private var attachments: [TaskAttachment] = []
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var showFileImporter = false
@@ -1156,7 +2677,12 @@ struct CreateTaskView: View {
 
                 Section("Дата и время") {
                     DatePicker("Когда", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
-                    Toggle("Локальное уведомление", isOn: $addNotification)
+                    Picker("Повтор", selection: $selectedRecurrence) {
+                        ForEach(TaskRecurrence.allCases) { recurrence in
+                            Text(recurrence.title).tag(recurrence)
+                        }
+                    }
+                    Toggle("Важное", isOn: $isImportant)
                 }
 
                 Section("Вложения") {
@@ -1211,21 +2737,56 @@ struct CreateTaskView: View {
     }
 
     private func saveTask() {
-        let newTask = Task(
-            title: title.trimmingCharacters(in: .whitespacesAndNewlines),
-            kind: selectedKind,
-            dueDate: dueDate,
-            subjectID: selectedSubjectID,
-            attachments: attachments
-        )
+        let prepared = buildTasksFromForm()
+        tasks.append(contentsOf: prepared)
 
-        tasks.append(newTask)
-
-        if addNotification {
-            NotificationManager.shared.scheduleNotification(for: newTask)
-        }
+        prepared.forEach { NotificationManager.shared.scheduleNotification(for: $0) }
 
         dismiss()
+    }
+
+    private func buildTasksFromForm() -> [Task] {
+        let baseTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let seriesID: UUID? = selectedRecurrence == .none ? nil : UUID()
+
+        var generated: [Task] = []
+        var currentDate = dueDate
+        for _ in 0..<selectedRecurrence.occurrenceLimit {
+            generated.append(
+                Task(
+                    title: baseTitle,
+                    kind: selectedKind,
+                    dueDate: currentDate,
+                    subjectID: selectedSubjectID,
+                    isPinned: isImportant,
+                    recurrence: selectedRecurrence,
+                    seriesID: seriesID,
+                    attachments: attachments
+                )
+            )
+
+            guard let nextDate = nextOccurrence(from: currentDate, recurrence: selectedRecurrence) else {
+                break
+            }
+            currentDate = nextDate
+        }
+
+        return generated
+    }
+
+    private func nextOccurrence(from date: Date, recurrence: TaskRecurrence) -> Date? {
+        switch recurrence {
+        case .none:
+            return nil
+        case .daily:
+            return Calendar.current.date(byAdding: .day, value: 1, to: date)
+        case .weekly:
+            return Calendar.current.date(byAdding: .day, value: 7, to: date)
+        case .monthly:
+            return Calendar.current.date(byAdding: .month, value: 1, to: date)
+        case .yearly:
+            return Calendar.current.date(byAdding: .year, value: 1, to: date)
+        }
     }
 
     private func handleSelectedPhotos(_ items: [PhotosPickerItem]) {
@@ -1280,7 +2841,8 @@ struct EditTaskView: View {
     @State private var selectedKind: TaskKind
     @State private var selectedSubjectID: UUID?
     @State private var dueDate: Date
-    @State private var addNotification = true
+        @State private var selectedRecurrence: TaskRecurrence
+    @State private var isImportant: Bool
     @State private var attachments: [TaskAttachment]
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var showFileImporter = false
@@ -1293,6 +2855,8 @@ struct EditTaskView: View {
         _selectedKind = State(initialValue: task.kind)
         _selectedSubjectID = State(initialValue: task.subjectID)
         _dueDate = State(initialValue: task.dueDate)
+        _selectedRecurrence = State(initialValue: task.recurrence)
+        _isImportant = State(initialValue: task.isPinned)
         _attachments = State(initialValue: task.attachments)
     }
 
@@ -1323,7 +2887,12 @@ struct EditTaskView: View {
 
                 Section("Дата и время") {
                     DatePicker("Когда", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
-                    Toggle("Локальное уведомление", isOn: $addNotification)
+                    Picker("Повтор", selection: $selectedRecurrence) {
+                        ForEach(TaskRecurrence.allCases) { recurrence in
+                            Text(recurrence.title).tag(recurrence)
+                        }
+                    }
+                    Toggle("Важное", isOn: $isImportant)
                 }
 
                 Section("Вложения") {
@@ -1387,18 +2956,29 @@ struct EditTaskView: View {
         tasks[index].kind = selectedKind
         tasks[index].dueDate = dueDate
         tasks[index].subjectID = selectedSubjectID
+        tasks[index].isPinned = isImportant
+        tasks[index].recurrence = selectedRecurrence
+        if selectedRecurrence == .none {
+            tasks[index].seriesID = nil
+        } else if tasks[index].seriesID == nil {
+            tasks[index].seriesID = UUID()
+        }
         let oldAttachments = tasks[index].attachments
         tasks[index].attachments = attachments
 
         let keptFileNames = Set(attachments.map(\.storedFileName))
         for attachment in oldAttachments where !keptFileNames.contains(attachment.storedFileName) {
-            AttachmentStorage.delete(attachment)
+            let usedElsewhere = tasks.contains { candidate in
+                guard candidate.id != task.id else { return false }
+                return candidate.attachments.contains(where: { $0.storedFileName == attachment.storedFileName })
+            }
+            if !usedElsewhere {
+                AttachmentStorage.delete(attachment)
+            }
         }
 
         NotificationManager.shared.removeNotification(for: task.id)
-        if addNotification {
-            NotificationManager.shared.scheduleNotification(for: tasks[index])
-        }
+        NotificationManager.shared.scheduleNotification(for: tasks[index])
 
         dismiss()
     }
@@ -1494,6 +3074,13 @@ struct TaskDetailsView: View {
                         Text(task.kind.title)
                         Spacer()
                         Text(Self.dateTimeFormatter.string(from: task.dueDate))
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack {
+                        Text("Повтор")
+                        Spacer()
+                        Text(task.recurrence.title)
                             .foregroundColor(.secondary)
                     }
 
